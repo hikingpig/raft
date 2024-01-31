@@ -5,6 +5,12 @@ type LogEntry struct {
 	Term    int
 }
 
+type CommitEntry struct {
+	Command interface{}
+	Index   int
+	Term    int
+}
+
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -33,6 +39,7 @@ type AppendEntriesReply struct {
 }
 type Consensus interface {
 	Report() (int, int, bool)
+	Submit(interface{}) bool
 	RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error
 }

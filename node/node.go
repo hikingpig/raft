@@ -12,31 +12,37 @@ import (
 )
 
 type Node struct {
-	mu          sync.Mutex
-	consen      raft_rpc.Consensus
-	id          int
-	peerIds     []int
-	listener    net.Listener
-	rpcServer   *rpc.Server
-	peerClients map[int]*rpc.Client
-	ready       <-chan struct{}
-	quit        chan struct{}
-	wg          sync.WaitGroup
+	mu           sync.Mutex
+	consen       raft_rpc.Consensus
+	id           int
+	peerIds      []int
+	listener     net.Listener
+	rpcServer    *rpc.Server
+	peerClients  map[int]*rpc.Client
+	ready        <-chan struct{}
+	quit         chan struct{}
+	commitSignal chan struct{}
+	commitChan   chan raft_rpc.CommitEntry
+	wg           sync.WaitGroup
 }
 
-func NewNode(id int, peerIds []int, ready <-chan struct{}) *Node {
+func NewNode(id int, peerIds []int, ready <-chan struct{}, commitChan chan raft_rpc.CommitEntry) *Node {
 	s := new(Node)
 	s.id = id
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
 	s.ready = ready
-	s.quit = make(chan struct{})
+	s.commitChan = commitChan
 	return s
 }
 
 func (n *Node) Start() {
 	n.mu.Lock()
-	n.consen = consensus.NewConsensus(n, n.peerIds, n.ready, n.quit)
+	// the node controls channels. when the node shutdowns, it will close the channels
+	// and signals all relevant goroutines to close
+	n.quit = make(chan struct{})
+	n.commitSignal = make(chan struct{}, 16)
+	n.consen = consensus.NewConsensus(n, n.peerIds, n.ready, n.quit, n.commitChan, n.commitSignal)
 
 	// Create a new RPC server and register a RPCProxy that forwards all methods
 	// to n.cm
@@ -86,6 +92,8 @@ func (s *Node) DisconnectAll() {
 // Shutdown closes the server and waits for it to shut down properly.
 func (s *Node) Shutdown() {
 	close(s.quit)
+	close(s.commitSignal)
+	// also close commitChan?
 	s.listener.Close()
 	s.wg.Wait()
 }
@@ -137,4 +145,8 @@ func (s *Node) Call(id int, serviceMethod string, args interface{}, reply interf
 
 func (s *Node) ReportConsensus() (int, int, bool) {
 	return s.consen.Report()
+}
+
+func (s *Node) Submit(command interface{}) bool {
+	return s.consen.Submit(command)
 }
