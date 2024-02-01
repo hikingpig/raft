@@ -94,10 +94,11 @@ func (f *follower) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.AppendEn
 		f.c.lastHeard = time.Now()
 		reply.Success = true
 		f.c.log = append(f.c.log[:args.PrevLogIndex+1], args.Entries[:]...)
-	}
-	if args.LeaderCommit > f.c.commitIndex {
-		f.c.commitIndex = min(args.LeaderCommit, len(f.c.log)-1)
-		f.c.commitSignal <- struct{}{}
+		// only update commitIndex if args'log is valid
+		if args.LeaderCommit > f.c.commitIndex {
+			f.c.commitIndex = min(args.LeaderCommit, len(f.c.log)-1)
+			f.c.commitSignal <- struct{}{}
+		}
 	}
 	return nil
 }
@@ -243,10 +244,10 @@ func (ca *candidate) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.Append
 		if ca.c.isLogEntriesValid(args) {
 			reply.Success = true
 			ca.c.log = append(ca.c.log[:args.PrevLogIndex+1], args.Entries[:]...)
-		}
-		if args.LeaderCommit > ca.c.commitIndex {
-			ca.c.commitIndex = min(args.LeaderCommit, len(ca.c.log)-1)
-			ca.c.commitSignal <- struct{}{}
+			if args.LeaderCommit > ca.c.commitIndex {
+				ca.c.commitIndex = min(args.LeaderCommit, len(ca.c.log)-1)
+				ca.c.commitSignal <- struct{}{}
+			}
 		}
 		ca.c.lastHeard = time.Now()
 		ca.c.updateState(ca.c.follower)
@@ -399,10 +400,10 @@ func (l *leader) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.AppendEntr
 		if l.c.isLogEntriesValid(args) {
 			reply.Success = true
 			l.c.log = append(l.c.log[:args.PrevLogIndex+1], args.Entries[:]...)
-		}
-		if args.LeaderCommit > l.c.commitIndex {
-			l.c.commitIndex = min(args.LeaderCommit, len(l.c.log)-1)
-			l.c.commitSignal <- struct{}{}
+			if args.LeaderCommit > l.c.commitIndex {
+				l.c.commitIndex = min(args.LeaderCommit, len(l.c.log)-1)
+				l.c.commitSignal <- struct{}{}
+			}
 		}
 		l.c.lastHeard = time.Now()
 		l.c.updateState(l.c.follower)
