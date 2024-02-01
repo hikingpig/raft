@@ -5,6 +5,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"testing"
@@ -129,6 +130,7 @@ func (h *Harness) ReconnectPeer(id int) {
 }
 
 func (h *Harness) CrashPeer(id int) {
+	fmt.Printf("======== before crash: %d, storage has data?%t\n", id, h.storage[id].HasData())
 	tlog("Crash %d", id)
 	h.DisconnectPeer(id)
 	h.alive[id] = false

@@ -3,6 +3,7 @@ package consensus
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -53,6 +54,7 @@ func NewConsensus(node raft_rpc.Caller, peerIds []int, ready <-chan struct{}, qu
 	c.matchIndex = make(map[int]int)
 
 	if c.storage.HasData() {
+		fmt.Println("============= has data")
 		c.restoreFromStorage()
 	}
 	// start the control loop
@@ -101,6 +103,7 @@ func (c *consensus) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
+	fmt.Printf("====== restore from storage, term: %d, log: %v\n", c.term, c.log)
 }
 
 func (c *consensus) persistToStorage() {
@@ -179,4 +182,74 @@ func (c *consensus) isLogUpToDate(args rpc.RequestVoteArgs) bool {
 func (c *consensus) isLogEntriesValid(args rpc.AppendEntriesArgs) bool {
 	return args.PrevLogIndex == -1 ||
 		(args.PrevLogIndex < len(c.log) && args.PrevLogTerm == c.log[args.PrevLogIndex].Term)
+}
+
+// sendAE is used when node is in "Leader" state
+func (c *consensus) sendAE() {
+	// sending AE requests to peers
+	for _, peerId := range c.peerIds {
+		// preparing args
+		c.mu.Lock()
+		ni := c.nextIndex[peerId]
+		prevLogIndex := ni - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 {
+			prevLogTerm = c.log[prevLogIndex].Term
+		}
+		entries := c.log[ni:]
+		args := rpc.AppendEntriesArgs{
+			Term:         c.term,
+			LeaderId:     c.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: c.commitIndex,
+		}
+		c.mu.Unlock()
+		go func(peerId int) {
+			var reply rpc.AppendEntriesReply
+			if err := c.node.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				// handle reply
+				if reply.Term > c.term { // compare to current term, not only savedTerm
+					c.term = reply.Term
+					if c.state == c.leader { // only transitions to follower from leader
+						// must update election event, else it will try to be candidate soon.
+						c.lastHeard = time.Now()
+						c.updateState(c.follower)
+					}
+					return
+				}
+				if c.state == c.leader && reply.Term == c.term {
+					if reply.Success {
+						// update nextIndex and matchIndex
+						c.nextIndex[peerId] = ni + len(entries)
+						c.matchIndex[peerId] = c.nextIndex[peerId] - 1
+						commitIndex := c.commitIndex
+						// find new commitIndex
+						for i := c.commitIndex + 1; i < len(c.log); i++ {
+							if c.log[i].Term == c.term {
+								matchCount := 1
+								// check if log[i] is replicated on majority of nodes
+								for _, peerId := range c.peerIds {
+									if c.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								if matchCount*2 > len(c.peerIds)+1 {
+									c.commitIndex = i
+								}
+							}
+						}
+						if c.commitIndex != commitIndex {
+							c.commitSignal <- struct{}{}
+						}
+					} else {
+						c.nextIndex[peerId] = ni - 1
+					}
+				}
+			}
+		}(peerId)
+	}
 }

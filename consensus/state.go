@@ -71,6 +71,7 @@ func (f *follower) requestVote(args rpc.RequestVoteArgs, reply *rpc.RequestVoteR
 			reply.VoteGranted = true
 			f.c.lastHeard = time.Now()
 		}
+		f.c.persistToStorage()
 	}
 	return nil
 }
@@ -89,6 +90,7 @@ func (f *follower) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.AppendEn
 	if args.Term > f.c.term {
 		f.c.term = args.Term
 		reply.Term = f.c.term
+		f.c.persistToStorage()
 	}
 	if f.c.isLogEntriesValid(args) {
 		f.c.lastHeard = time.Now()
@@ -99,6 +101,7 @@ func (f *follower) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.AppendEn
 			f.c.commitIndex = min(args.LeaderCommit, len(f.c.log)-1)
 			f.c.commitSignal <- struct{}{}
 		}
+		f.c.persistToStorage()
 	}
 	return nil
 }
@@ -222,6 +225,7 @@ func (ca *candidate) requestVote(args rpc.RequestVoteArgs, reply *rpc.RequestVot
 			reply.VoteGranted = true
 			ca.c.lastHeard = time.Now()
 		}
+		ca.c.persistToStorage()
 		ca.c.updateState(ca.c.follower)
 	}
 	return nil
@@ -236,22 +240,27 @@ func (ca *candidate) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.Append
 	defer ca.c.mu.Unlock()
 	reply.Success = false
 	reply.Term = ca.c.term
-	// args.Term == ca.c.term, another node won the election and become leader!
-	// now it tells the candidate AE. the candidate should become follower
-	if args.Term >= ca.c.term {
+	if args.Term < ca.c.term {
+		return nil
+	}
+	if args.Term > ca.c.term {
 		ca.c.term = args.Term
 		reply.Term = ca.c.term
-		if ca.c.isLogEntriesValid(args) {
-			reply.Success = true
-			ca.c.log = append(ca.c.log[:args.PrevLogIndex+1], args.Entries[:]...)
-			if args.LeaderCommit > ca.c.commitIndex {
-				ca.c.commitIndex = min(args.LeaderCommit, len(ca.c.log)-1)
-				ca.c.commitSignal <- struct{}{}
-			}
-		}
-		ca.c.lastHeard = time.Now()
-		ca.c.updateState(ca.c.follower)
+		ca.c.persistToStorage()
 	}
+	if !ca.c.isLogEntriesValid(args) {
+		return nil
+	}
+	// args.Term == ca.c.term && ca.c.isLogEntriesValid
+	reply.Success = true
+	ca.c.log = append(ca.c.log[:args.PrevLogIndex+1], args.Entries[:]...)
+	ca.c.persistToStorage()
+	if args.LeaderCommit > ca.c.commitIndex {
+		ca.c.commitIndex = min(args.LeaderCommit, len(ca.c.log)-1)
+		ca.c.commitSignal <- struct{}{}
+	}
+	ca.c.lastHeard = time.Now()
+	ca.c.updateState(ca.c.follower)
 	return nil
 }
 
@@ -290,72 +299,7 @@ func (l *leader) start() {
 				if state != l.c.leader {
 					return
 				}
-				// sending heartbeats to peers
-				for _, peerId := range l.c.peerIds {
-					// preparing args
-					l.c.mu.Lock()
-					ni := l.c.nextIndex[peerId]
-					prevLogIndex := ni - 1
-					prevLogTerm := -1
-					if prevLogIndex >= 0 {
-						prevLogTerm = l.c.log[prevLogIndex].Term
-					}
-					entries := l.c.log[ni:]
-					args := rpc.AppendEntriesArgs{
-						Term:         l.c.term,
-						LeaderId:     l.c.id,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      entries,
-						LeaderCommit: l.c.commitIndex,
-					}
-					l.c.mu.Unlock()
-					go func(peerId int) {
-						var reply rpc.AppendEntriesReply
-						if err := l.c.node.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
-							l.c.mu.Lock()
-							defer l.c.mu.Unlock()
-							// handle reply
-							if reply.Term > l.c.term { // compare to current term, not only savedTerm
-								l.c.term = reply.Term
-								if l.c.state == l.c.leader { // only transitions to follower from leader
-									// must update election event, else it will try to be candidate soon.
-									l.c.lastHeard = time.Now()
-									l.c.updateState(l.c.follower)
-								}
-								return
-							}
-							if l.c.state == l.c.leader && reply.Term == l.c.term {
-								if reply.Success {
-									// update nextIndex and matchIndex
-									l.c.nextIndex[peerId] = ni + len(entries)
-									l.c.matchIndex[peerId] = l.c.nextIndex[peerId] - 1
-									commitIndex := l.c.commitIndex
-									// find new commitIndex
-									for i := l.c.commitIndex + 1; i < len(l.c.log); i++ {
-										if l.c.log[i].Term == l.c.term {
-											matchCount := 1
-											// check if log[i] is replicated on majority of nodes
-											for _, peerId := range l.c.peerIds {
-												if l.c.matchIndex[peerId] >= i {
-													matchCount++
-												}
-											}
-											if matchCount*2 > len(l.c.peerIds)+1 {
-												l.c.commitIndex = i
-											}
-										}
-									}
-									if l.c.commitIndex != commitIndex {
-										l.c.commitSignal <- struct{}{}
-									}
-								} else {
-									l.c.nextIndex[peerId] = ni - 1
-								}
-							}
-						}
-					}(peerId)
-				}
+				l.c.sendAE()
 				select {
 				case <-l.c.quit: // exit control loop when node shutdown
 					return
@@ -375,6 +319,7 @@ func (l *leader) requestVote(args rpc.RequestVoteArgs, reply *rpc.RequestVoteRep
 	if args.Term > l.c.term {
 		l.c.term = args.Term
 		reply.Term = l.c.term
+		l.c.persistToStorage()
 		if l.c.isLogUpToDate(args) {
 			reply.VoteGranted = true
 			l.c.lastHeard = time.Now()
@@ -405,6 +350,7 @@ func (l *leader) appendEntries(args rpc.AppendEntriesArgs, reply *rpc.AppendEntr
 				l.c.commitSignal <- struct{}{}
 			}
 		}
+		l.c.persistToStorage()
 		l.c.lastHeard = time.Now()
 		l.c.updateState(l.c.follower)
 	}
