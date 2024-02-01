@@ -9,6 +9,7 @@ import (
 
 	"github.com/hikingpig/raft/consensus"
 	raft_rpc "github.com/hikingpig/raft/rpc"
+	"github.com/hikingpig/raft/storage"
 )
 
 type Node struct {
@@ -24,15 +25,17 @@ type Node struct {
 	commitSignal chan struct{}
 	commitChan   chan raft_rpc.CommitEntry
 	wg           sync.WaitGroup
+	storage      storage.Storage
 }
 
-func NewNode(id int, peerIds []int, ready <-chan struct{}, commitChan chan raft_rpc.CommitEntry) *Node {
+func NewNode(id int, peerIds []int, ready <-chan struct{}, commitChan chan raft_rpc.CommitEntry, storage storage.Storage) *Node {
 	s := new(Node)
 	s.id = id
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
 	s.ready = ready
 	s.commitChan = commitChan
+	s.storage = storage
 	return s
 }
 
@@ -42,7 +45,7 @@ func (n *Node) Start() {
 	// and signals all relevant goroutines to close
 	n.quit = make(chan struct{})
 	n.commitSignal = make(chan struct{}, 16)
-	n.consen = consensus.NewConsensus(n, n.peerIds, n.ready, n.quit, n.commitChan, n.commitSignal)
+	n.consen = consensus.NewConsensus(n, n.peerIds, n.ready, n.quit, n.commitChan, n.commitSignal, n.storage)
 
 	// Create a new RPC server and register a RPCProxy that forwards all methods
 	// to n.cm

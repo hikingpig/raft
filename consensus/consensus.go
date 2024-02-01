@@ -1,12 +1,16 @@
 package consensus
 
 import (
+	"bytes"
+	"encoding/gob"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/hikingpig/raft/rpc"
 	raft_rpc "github.com/hikingpig/raft/rpc"
+	"github.com/hikingpig/raft/storage"
 )
 
 // consensus is a state machine
@@ -28,9 +32,10 @@ type consensus struct {
 	lastApplied                 int
 	nextIndex                   map[int]int
 	matchIndex                  map[int]int
+	storage                     storage.Storage
 }
 
-func NewConsensus(node raft_rpc.Caller, peerIds []int, ready <-chan struct{}, quit <-chan struct{}, commitChan chan<- rpc.CommitEntry, commitSignal chan struct{}) *consensus {
+func NewConsensus(node raft_rpc.Caller, peerIds []int, ready <-chan struct{}, quit <-chan struct{}, commitChan chan<- rpc.CommitEntry, commitSignal chan struct{}, storage storage.Storage) *consensus {
 	c := &consensus{}
 	c.node = node
 	c.peerIds = peerIds
@@ -41,11 +46,15 @@ func NewConsensus(node raft_rpc.Caller, peerIds []int, ready <-chan struct{}, qu
 	c.state = c.follower
 	c.commitChan = commitChan
 	c.commitSignal = commitSignal
-
+	c.storage = storage
 	c.commitIndex = -1
 	c.lastApplied = -1
 	c.nextIndex = make(map[int]int)
 	c.matchIndex = make(map[int]int)
+
+	if c.storage.HasData() {
+		c.restoreFromStorage()
+	}
 	// start the control loop
 	go func() {
 		<-ready
@@ -69,9 +78,43 @@ func (c *consensus) Submit(command interface{}) bool {
 	defer c.mu.Unlock()
 	if c.state == c.leader {
 		c.log = append(c.log, rpc.LogEntry{Command: command, Term: c.term})
+		c.persistToStorage()
 		return true
 	}
 	return false
+}
+
+func (c *consensus) restoreFromStorage() {
+	if termData, found := c.storage.Get("term"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&c.term); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("term not found in storage")
+	}
+	if logData, found := c.storage.Get("log"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := d.Decode(&c.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+func (c *consensus) persistToStorage() {
+	var term bytes.Buffer
+	if err := gob.NewEncoder(&term).Encode(c.term); err != nil {
+		log.Fatal(err)
+	}
+	c.storage.Set("term", term.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(c.log); err != nil {
+		log.Fatal(err)
+	}
+	c.storage.Set("log", logData.Bytes())
 }
 
 func (c *consensus) RequestVote(args rpc.RequestVoteArgs, reply *rpc.RequestVoteReply) error {

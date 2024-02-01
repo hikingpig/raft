@@ -17,11 +17,12 @@ import (
 type Harness struct {
 	// cluster is a list of all the raft servers participating in a cluster.
 	cluster []*node.Node
-
+	storage []*MapStorage
 	// connected has a bool per server in cluster, specifying whether this server
 	// is currently connected to peers (if false, it's partitioned and no messages
 	// will pass to or from it).
 	connected   []bool
+	alive       []bool
 	commits     [][]rpc.CommitEntry
 	commitChans []chan rpc.CommitEntry
 
@@ -35,10 +36,11 @@ type Harness struct {
 func NewHarness(t *testing.T, n int) *Harness {
 	ns := make([]*node.Node, n)
 	connected := make([]bool, n)
+	alive := make([]bool, n)
 	ready := make(chan struct{})
 	commitChans := make([]chan rpc.CommitEntry, n)
 	commits := make([][]rpc.CommitEntry, n)
-
+	storage := make([]*MapStorage, n)
 	// Create all Servers in this cluster, assign ids and peer ids.
 	for i := 0; i < n; i++ {
 		peerIds := make([]int, 0)
@@ -47,8 +49,9 @@ func NewHarness(t *testing.T, n int) *Harness {
 				peerIds = append(peerIds, p)
 			}
 		}
+		storage[i] = NewMapStorage()
 		commitChans[i] = make(chan rpc.CommitEntry)
-		ns[i] = node.NewNode(i, peerIds, ready, commitChans[i])
+		ns[i] = node.NewNode(i, peerIds, ready, commitChans[i], storage[i])
 		ns[i].Start() // @@@
 	}
 
@@ -60,13 +63,16 @@ func NewHarness(t *testing.T, n int) *Harness {
 			}
 		}
 		connected[i] = true
+		alive[i] = true
 	}
 	close(ready) // @@@
 	h := &Harness{
 		cluster:     ns,
+		storage:     storage,
 		commitChans: commitChans,
 		commits:     commits,
 		connected:   connected,
+		alive:       alive,
 		n:           n,
 		t:           t,
 	}
@@ -87,7 +93,10 @@ func (h *Harness) Shutdown() {
 		h.connected[i] = false
 	}
 	for i := 0; i < h.n; i++ {
-		h.cluster[i].Shutdown()
+		if h.alive[i] {
+			h.alive[i] = false
+			h.cluster[i].Shutdown()
+		}
 	}
 }
 
@@ -107,7 +116,7 @@ func (h *Harness) DisconnectPeer(id int) {
 func (h *Harness) ReconnectPeer(id int) {
 	tlog("Reconnect %d", id)
 	for j := 0; j < h.n; j++ {
-		if j != id {
+		if j != id && h.alive[j] {
 			if err := h.cluster[id].ConnectToPeer(j, h.cluster[j].GetListenAddr()); err != nil {
 				h.t.Fatal(err)
 			}
@@ -119,11 +128,43 @@ func (h *Harness) ReconnectPeer(id int) {
 	h.connected[id] = true
 }
 
+func (h *Harness) CrashPeer(id int) {
+	tlog("Crash %d", id)
+	h.DisconnectPeer(id)
+	h.alive[id] = false
+	h.cluster[id].Shutdown()
+	h.mu.Lock()
+	h.commits[id] = h.commits[id][:0]
+	h.mu.Unlock()
+}
+
+func (h *Harness) RestartPeer(id int) {
+	if h.alive[id] {
+		log.Fatalf("id=%d is alive in RestartPeer", id)
+	}
+	tlog("Restart %d", id)
+
+	peerIds := make([]int, 0)
+	for p := 0; p < h.n; p++ {
+		if p != id {
+			peerIds = append(peerIds, p)
+		}
+	}
+
+	ready := make(chan struct{})
+	h.cluster[id] = node.NewNode(id, peerIds, ready, h.commitChans[id], h.storage[id])
+	h.cluster[id].Start()
+	h.ReconnectPeer(id)
+	close(ready)
+	h.alive[id] = true
+	sleepMs(20)
+}
+
 // CheckSingleLeader checks that only a single server thinks it's the leader.
 // Returns the leader's id and term. It retries several times if no leader is
 // identified yet.
 func (h *Harness) CheckSingleLeader() (int, int) {
-	for r := 0; r < 5; r++ {
+	for r := 0; r < 8; r++ {
 		leaderId := -1
 		leaderTerm := -1
 		for i := 0; i < h.n; i++ {
@@ -263,4 +304,35 @@ func (h *Harness) collectCommits(i int) {
 		h.commits[i] = append(h.commits[i], c)
 		h.mu.Unlock()
 	}
+}
+
+type MapStorage struct {
+	mu sync.Mutex
+	m  map[string][]byte
+}
+
+func NewMapStorage() *MapStorage {
+	m := make(map[string][]byte)
+	return &MapStorage{
+		m: m,
+	}
+}
+
+func (ms *MapStorage) Get(key string) ([]byte, bool) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	v, found := ms.m[key]
+	return v, found
+}
+
+func (ms *MapStorage) Set(key string, value []byte) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.m[key] = value
+}
+
+func (ms *MapStorage) HasData() bool {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	return len(ms.m) > 0
 }
