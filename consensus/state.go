@@ -288,9 +288,9 @@ func (l *leader) start() {
 			l.c.matchIndex[peerId] = -1
 		}
 		l.c.mu.Unlock()
-		go func() {
-			ticker := time.NewTicker(50 * time.Millisecond)
-			defer ticker.Stop()
+		go func(heartbeatTimeout time.Duration) {
+			timer := time.NewTimer(heartbeatTimeout)
+			defer timer.Stop()
 			for {
 				l.c.mu.Lock()
 				state := l.c.state
@@ -303,11 +303,18 @@ func (l *leader) start() {
 				select {
 				case <-l.c.quit: // exit control loop when node shutdown
 					return
-				case <-ticker.C:
+				case <-l.c.AESignal:
+					if !timer.Stop() {
+						<-timer.C // drain timer.C
+					}
+					timer.Reset(heartbeatTimeout)
+					continue
+				case <-timer.C:
+					timer.Reset(heartbeatTimeout)
 					continue
 				}
 			}
-		}()
+		}(50 * time.Millisecond)
 	}()
 }
 

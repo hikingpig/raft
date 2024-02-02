@@ -3,7 +3,6 @@ package consensus
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -28,6 +27,7 @@ type consensus struct {
 	quit                        <-chan struct{}
 	commitChan                  chan<- rpc.CommitEntry
 	commitSignal                chan struct{}
+	AESignal                    chan struct{}
 	log                         []rpc.LogEntry
 	commitIndex                 int
 	lastApplied                 int
@@ -47,6 +47,7 @@ func NewConsensus(node raft_rpc.Caller, peerIds []int, ready <-chan struct{}, qu
 	c.state = c.follower
 	c.commitChan = commitChan
 	c.commitSignal = commitSignal
+	c.AESignal = make(chan struct{})
 	c.storage = storage
 	c.commitIndex = -1
 	c.lastApplied = -1
@@ -54,7 +55,6 @@ func NewConsensus(node raft_rpc.Caller, peerIds []int, ready <-chan struct{}, qu
 	c.matchIndex = make(map[int]int)
 
 	if c.storage.HasData() {
-		fmt.Println("============= has data")
 		c.restoreFromStorage()
 	}
 	// start the control loop
@@ -81,6 +81,14 @@ func (c *consensus) Submit(command interface{}) bool {
 	if c.state == c.leader {
 		c.log = append(c.log, rpc.LogEntry{Command: command, Term: c.term})
 		c.persistToStorage()
+		// after submit 1st command, c.AESignal will be handled and it required lock
+		// to proceed and reach select statement
+		// if lock is not released in submit, then we don't select on AESignal channel
+		// and c.AESignal send will be block.
+		// so send AESignal always in another goroutine and always release lock immedidately
+		go func() {
+			c.AESignal <- struct{}{}
+		}()
 		return true
 	}
 	return false
@@ -103,7 +111,6 @@ func (c *consensus) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
-	fmt.Printf("====== restore from storage, term: %d, log: %v\n", c.term, c.log)
 }
 
 func (c *consensus) persistToStorage() {
@@ -244,6 +251,7 @@ func (c *consensus) sendAE() {
 						}
 						if c.commitIndex != commitIndex {
 							c.commitSignal <- struct{}{}
+							c.AESignal <- struct{}{}
 						}
 					} else {
 						c.nextIndex[peerId] = ni - 1
